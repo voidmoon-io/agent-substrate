@@ -1,0 +1,72 @@
+# shart-cloud fork only: builds the substrate images with ko, pushes them to
+# ghcr.io/shart-cloud/substrate/*, and uploads the digest-pinned install
+# manifests (kind path of hack/install-ate.sh) as an artifact for talos-gitops.
+name: shart-cloud publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit/tag to build (must match the substrate version AX pins)
+        required: true
+        default: 672533541dbf
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      KO_DEFAULTPLATFORMS: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Logs in to ghcr.io and sets KO_DOCKER_REPO=ghcr.io/shart-cloud/substrate.
+      - uses: ko-build/setup-ko@v0.9
+
+      - name: Render
+        run: |
+          set -o errexit -o nounset -o pipefail
+          mapfile -t LDFLAGS < <(make -s ldflags | sed 's/^/--ldflags=/')
+          VERSION_RAW="$(make -s ldflags | sed -n 's/.*internal\/version\.Version=//p' | head -n1)"
+          read -r V SUFFIX < <(go run ./internal/versionlabel/cmd "${VERSION_RAW}")
+
+          subst() {
+            sed -e "s/: \${SUBSTRATE_VERSION}\$/: \"${V}\"/" \
+                -e "s/\${SUBSTRATE_VERSION}/${V}/g" \
+                -e "s/\${SUBSTRATE_VERSION_SUFFIX}/${SUFFIX}/g"
+          }
+          ko_resolve() { ko resolve -B -t "${V}" "${LDFLAGS[@]}" -f "$@"; }
+
+          mkdir -p out/crds out/system
+          cp manifests/ate-install/generated/*.yaml out/crds/
+          kubectl kustomize manifests/ate-install/kind --load-restrictor LoadRestrictionsNone \
+            | ko_resolve - | subst > out/system/ate-system.yaml
+          kubectl kustomize manifests/ate-install/kind/postgres --load-restrictor LoadRestrictionsNone \
+            > out/system/postgres.yaml
+          ko_resolve manifests/ate-install/atenet-egress.yaml > out/system/atenet-egress.yaml
+          cp manifests/ate-install/sandboxconfig-validation.yaml \
+             manifests/ate-install/sandboxconfig-gvisor.yaml out/system/
+
+          # Images launched on demand rather than referenced by the install
+          # manifests: the gVisor worker helper, the counter demo, and the
+          # kubectl-ate CLI used to bootstrap CA/JWT secrets.
+          ko build -B -t "${V}" "${LDFLAGS[@]}" ./cmd/ateom-gvisor ./demos/counter > out/worker-images.txt
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$(make -s ldflags | tr '\n' ' ')" -o out/kubectl-ate ./cmd/kubectl-ate
+
+          printf '%s\n' "${V}" > out/SUBSTRATE_VERSION
+          printf '%s\n' "$(git rev-parse HEAD)" > out/SOURCE_COMMIT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: substrate-manifests
+          path: out/
