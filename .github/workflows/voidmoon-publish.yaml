@@ -1,7 +1,7 @@
-# shart-cloud fork only: builds the substrate images with ko, pushes them to
-# ghcr.io/shart-cloud/substrate/*, and uploads the digest-pinned install
+# voidmoon-io fork only: builds the substrate images with ko, pushes them to
+# ghcr.io/voidmoon-io/agent-substrate/*, and uploads the digest-pinned install
 # manifests (kind path of hack/install-ate.sh) as an artifact for talos-gitops.
-name: shart-cloud publish
+name: voidmoon publish
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Logs in to ghcr.io and sets KO_DOCKER_REPO=ghcr.io/shart-cloud/substrate.
+      # Logs in to ghcr.io and sets KO_DOCKER_REPO=ghcr.io/voidmoon-io/agent-substrate.
       - uses: ko-build/setup-ko@v0.9
 
       - name: Render
