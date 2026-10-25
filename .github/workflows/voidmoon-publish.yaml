@@ -1,0 +1,92 @@
+# voidmoon-io fork only: publishes every substrate image with
+# `ate-setup publish release-images` to ghcr.io/voidmoon-io/agent-substrate/*,
+# then renders the digest-pinned manifests `deploy ate-system` would apply
+# (`ate-setup voidmoon render`, see cmd/ate-setup/internal/steps/voidmoon.go)
+# as an artifact for shart-cloud/talos-gitops (scripts/agent-substrate/render.sh).
+name: voidmoon publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit/tag/branch to build (must match the substrate version AX pins)
+        required: true
+        default: voidmoon/v0.5.0
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      KO_DEFAULTPLATFORMS: linux/amd64
+      REPO: ghcr.io/voidmoon-io/agent-substrate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Logs in to ghcr.io for ko; the docker login is for the envoy-dataplane
+      # image, which is built with buildx rather than ko.
+      - uses: ko-build/setup-ko@v0.9
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and render
+        run: |
+          set -o errexit -o nounset -o pipefail
+          V="$(git describe --tags --always --dirty)"
+          go build -o "${RUNNER_TEMP}/ate-setup" ./cmd/ate-setup
+
+          # ate-setup reads a kubeconfig before every command; neither of these
+          # contacts a cluster.
+          cat > "${RUNNER_TEMP}/kubeconfig" <<'EOF'
+          apiVersion: v1
+          kind: Config
+          clusters: [{name: none, cluster: {server: "https://127.0.0.1:1"}}]
+          users: [{name: none, user: {token: none}}]
+          contexts: [{name: none, context: {cluster: none, user: none}}]
+          current-context: none
+          EOF
+          ate() { "${RUNNER_TEMP}/ate-setup" --no-dev-env --no-report-defaults \
+            --kubeconfig "${RUNNER_TEMP}/kubeconfig" --context none "$@"; }
+
+          VERSION="${V}" ate publish release-images --ko-docker-repo "${REPO}" | tee "${RUNNER_TEMP}/published.txt"
+
+          # The kind profile: bundled PostgreSQL, in-cluster rustfs for
+          # snapshots and the in-namespace otel stack. Credential injection is
+          # off; AX tasks reach models through key-adding proxies instead.
+          mkdir -p out
+          ate --kind --credential-provider='{"enabled":false}' \
+            --image-repo "${REPO}" --image-tag "${V}" \
+            voidmoon render --out out
+
+          # Images no manifest references: the worker images WorkerPools name
+          # and the counter demo.
+          grep -E '/(ateom-gvisor|ateom-microvm|counter)[:@]' "${RUNNER_TEMP}/published.txt" > out/worker-images.txt
+
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o out/kubectl-ate ./cmd/kubectl-ate
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o out/ate-setup ./cmd/ate-setup
+          # bootstrap and the microvm asset scripts read the checked-in
+          # manifests, so ship the tree the binaries were built from.
+          tar -czf out/manifests.tar.gz manifests hack/microvm-assets
+
+          printf '%s\n' "${V}" > out/SUBSTRATE_VERSION
+          git rev-parse HEAD > out/SOURCE_COMMIT
+          cat out/worker-images.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: substrate-manifests
+          path: out/
