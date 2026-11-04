@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,86 +12,223 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# voidmoon-io fork only: publishes every substrate image with
-# `ate-setup publish release-images` to ghcr.io/voidmoon-io/agent-substrate/*,
-# then renders the digest-pinned manifests `deploy ate-system` would apply
-# (`ate-setup voidmoon render`, see cmd/ate-setup/internal/steps/voidmoon.go)
-# as an artifact for shart-cloud/talos-gitops (scripts/agent-substrate/render.sh).
-name: voidmoon publish
+# Runs every root-gated test package under sudo. A package is root-gated when
+# its tests import internal/roottest (the tests self-skip unless run as root),
+# so adding privileged tests anywhere picks them up here with no CI change.
+# Extra arguments are passed through to `go test` (e.g. -v, -run).
 
-on:
+name: voidmoon CI on Talos
+'on':
   workflow_dispatch:
     inputs:
-      ref:
-        description: Commit/tag/branch to build (must match the substrate version AX pins)
-        required: true
-        default: voidmoon/v0.5.0
-
+      publish:
+        description: Publish this tested commit and upload deployment manifests
+        type: boolean
+        default: false
 permissions:
   contents: read
-  packages: write
-
+concurrency:
+  group: voidmoon-ci-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
+  run-tests:
+    runs-on: voidmoon-ci
+    timeout-minutes: 90
+    env:
+      ARTIFACTS: ${{ github.workspace }}/_artifacts
+    steps:
+    - name: Checkout
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Start isolated Docker and check runner
+      run: bash .github/talos/prepare.sh
+    - name: Setup Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: build for arm64
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" build-for-arm64
+    - name: unit tests
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" unit-tests
+    - name: apitool tests
+      working-directory: tools/apitool
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" apitool-tests
+    - name: junittool tests
+      working-directory: tools/junittool
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" junittool-tests
+    - name: dynamic module tests
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" dynamic-module-tests
+    - name: root-gated tests
+      env:
+        ROOT_JUNIT_FILE: ${{ github.workspace }}/_artifacts/root.xml
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" root-gated-tests
+    - name: Require tests to have run
+      if: always()
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" require-tests-to-have-run
+    - name: Summarize test failures
+      if: always()
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" summarize-test-failures
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: test-results-unit
+        path: ${{ env.ARTIFACTS }}
+        if-no-files-found: error
+        retention-days: 7
+    - name: verify
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" verify
+    if: github.repository == 'voidmoon-io/agent-substrate' && github.event_name == 'workflow_dispatch'
+  verify-migrations:
+    if: github.repository == 'voidmoon-io/agent-substrate' && github.event_name == 'workflow_dispatch'
+    runs-on: voidmoon-ci
+    timeout-minutes: 90
+    steps:
+    - name: Checkout
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Start isolated Docker and check runner
+      run: bash .github/talos/prepare.sh
+    - name: Verify immutable PostgreSQL migrations
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" verify-immutable-postgresql-migrations
+  e2e-test:
+    name: e2e (${{ matrix.dataplane }}, preview ${{ matrix.preview }})
+    runs-on: voidmoon-ci
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        dataplane:
+        - envoy
+        - agentgateway
+        preview:
+        - 'off'
+        - 'on'
+      max-parallel: 1
+    env:
+      E2E_ATENET_DATAPLANE: ${{ matrix.dataplane }}
+      ATE_INSTALL_E2E_TUNING: 'true'
+      ATE_CREDENTIAL_PROVIDER: '{"name":"k8s.io"}'
+      ATE_PREVIEW: ${{ matrix.preview == 'on' && 'ALL' || '' }}
+      ATE_INGRESS_ALLOWED_SPIFFE_IDS: spiffe://cluster.local/ns/ate-e2e-router-client/sa/router-client
+      LANE_SUFFIX: ${{ matrix.preview == 'on' && '-preview' || '' }}
+      ARTIFACTS: ${{ github.workspace }}/_artifacts
+    steps:
+    - name: Checkout
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      with:
+        persist-credentials: false
+    - name: Start isolated Docker and check runner
+      run: bash .github/talos/prepare.sh
+    - name: Setup Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      with:
+        driver-opts: 'network=host
+
+          image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe'
+        buildkitd-config-inline: "[registry.\"localhost:5001\"]\n  http = true\n"
+        version: v0.38.2
+    - name: Create cluster
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" create-cluster
+    - name: Install Agent Substrate (${{ matrix.dataplane }})
+      env:
+        ATE_ATENET_DATAPLANE: ${{ matrix.dataplane }}
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" install-agent-substrate--matrixdataplane-
+    - name: Install CSI NFS driver
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" install-csi-nfs-driver
+    - name: Deploy micro-VM counter demo
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" deploy-micro-vm-counter-demo
+    - name: Deploy gVisor counter demo
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" deploy-gvisor-counter-demo
+    - name: Deploy egress demos
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" deploy-egress-demos
+    - name: Trust local TLS origins in egress gateway
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" trust-local-tls-origins-in-egress-gateway
+    - name: Focus the node on gVisor
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" focus-the-node-on-gvisor
+    - name: Run E2E tests (gVisor)
+      env:
+        E2E_PARALLELISM: 8
+        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-gvisor${{ env.LANE_SUFFIX }}.xml
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" run-e2e-tests-gvisor
+    - name: Focus the node on micro-VM
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" focus-the-node-on-micro-vm
+    - name: Run E2E tests (micro-VM)
+      env:
+        E2E_SANDBOX_CLASS: microvm
+        E2E_PARALLELISM: 8
+        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-microvm${{ env.LANE_SUFFIX }}.xml
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" run-e2e-tests-micro-vm
+    - name: Require every lane to have run tests
+      if: always()
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" require-every-lane-to-have-run-tests
+    - name: Summarize test failures
+      if: always()
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" summarize-test-failures
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: test-results-e2e-${{ matrix.dataplane }}${{ env.LANE_SUFFIX }}
+        path: ${{ env.ARTIFACTS }}
+        if-no-files-found: error
+        retention-days: 7
+    - name: Dump diagnostics on failure
+      if: failure()
+      run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" dump-diagnostics-on-failure
+    if: github.repository == 'voidmoon-io/agent-substrate' && github.event_name == 'workflow_dispatch'
   publish:
-    runs-on: ubuntu-latest
+    runs-on: voidmoon-ci
     env:
       KO_DEFAULTPLATFORMS: linux/amd64
       REPO: ghcr.io/voidmoon-io/agent-substrate
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      # Logs in to ghcr.io for ko; the docker login is for the envoy-dataplane
-      # image, which is built with buildx rather than ko.
-      - uses: ko-build/setup-ko@v0.9
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish and render
-        run: |
-          set -o errexit -o nounset -o pipefail
-          V="$(git describe --tags --always --dirty)"
-          go build -o "${RUNNER_TEMP}/ate-setup" ./cmd/ate-setup
-
-          ate() { "${RUNNER_TEMP}/ate-setup" --no-dev-env --no-report-defaults "$@"; }
-
-          VERSION="${V}" ate publish release-images --ko-docker-repo "${REPO}" | tee "${RUNNER_TEMP}/published.txt"
-
-          # The kind profile: bundled PostgreSQL, in-cluster rustfs for
-          # snapshots and the in-namespace otel stack. Credential injection is
-          # off; AX tasks reach models through key-adding proxies instead.
-          mkdir -p out
-          ate --kind --credential-provider='{"enabled":false}' \
-            --image-repo "${REPO}" --image-tag "${V}" \
-            voidmoon render --out out
-
-          # This command emits references even when release-images skipped existing tags.
-          VERSION="${V}" ate publish worker-images --ko-docker-repo "${REPO}" > "${RUNNER_TEMP}/workers.txt"
-          awk '$1 == "ateworker-gvisor:" || $1 == "ateworker-microvm:" {print $2}' \
-            "${RUNNER_TEMP}/workers.txt" > out/worker-images.txt
-          test "$(wc -l < out/worker-images.txt)" -eq 2
-
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o out/kubectl-ate ./cmd/kubectl-ate
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o out/ate-setup ./cmd/ate-setup
-          # bootstrap reads the checked-in
-          # manifests, so ship the tree the binaries were built from.
-          tar -czf out/manifests.tar.gz manifests
-
-          printf '%s\n' "${V}" > out/SUBSTRATE_VERSION
-          git rev-parse HEAD > out/SOURCE_COMMIT
-          cat out/worker-images.txt
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: substrate-manifests
-          path: out/
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Start isolated Docker
+      run: bash .github/talos/prepare.sh
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      with:
+        go-version-file: go.mod
+        cache: false
+    - uses: ko-build/setup-ko@d006021bd0c28d1ce33a07e7943d48b079944c8d
+      with:
+        version: v0.19.1
+        use-sudo: true
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      with:
+        version: v0.38.2
+        driver-opts: image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+    - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Publish and render
+      run: bash .github/talos/publish.sh
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: substrate-manifests
+        path: out/
+        retention-days: 7
+    timeout-minutes: 120
+    needs:
+    - run-tests
+    - verify-migrations
+    - e2e-test
+    if: inputs.publish && github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
