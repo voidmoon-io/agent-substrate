@@ -1,2 +1,2 @@
 self-hosted-runner:
-  labels: [voidmoon-ci]
+  labels: [voidmoon-ci, voidmoon-e2e]

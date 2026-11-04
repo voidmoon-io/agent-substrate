@@ -93,7 +93,9 @@ jobs:
       run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" verify-immutable-postgresql-migrations
   e2e-test:
     name: e2e (${{ matrix.dataplane }}, preview ${{ matrix.preview }})
-    runs-on: voidmoon-ci
+    runs-on:
+      group: voidmoon-ci
+      labels: voidmoon-e2e
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -153,7 +155,7 @@ jobs:
       run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" focus-the-node-on-gvisor
     - name: Run E2E tests (gVisor)
       env:
-        E2E_PARALLELISM: 8
+        E2E_PARALLELISM: 4
         E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-gvisor${{ env.LANE_SUFFIX }}.xml
       run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" run-e2e-tests-gvisor
     - name: Focus the node on micro-VM
@@ -161,7 +163,7 @@ jobs:
     - name: Run E2E tests (micro-VM)
       env:
         E2E_SANDBOX_CLASS: microvm
-        E2E_PARALLELISM: 8
+        E2E_PARALLELISM: 4
         E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-microvm${{ env.LANE_SUFFIX }}.xml
       run: bash "${GITHUB_WORKSPACE}/.github/talos/run.sh" run-e2e-tests-micro-vm
     - name: Require every lane to have run tests
